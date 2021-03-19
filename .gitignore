@@ -1,0 +1,7 @@
+SI_gpu
+main
+*.o
+figure.pdf
+*.txt
+draw.gp
+run.sh
