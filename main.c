@@ -61,16 +61,29 @@
   Compute the optimal number of particles for gpu process
  */
 int particle_partition(int n, int argc, char ** argv);
-/*
-  get observations for the current time step
- */
-void getObs(obs_t *ob, int t);
-
 /* Print the particle with the max weight */
 void printMax(state_t *particles, double * weight, int start, int end);
-
+/* normalize the weight and compute ess */
+double normalize(double *weights, int N);
 /* prescan the weight array */
-double prescan(double *weights, int N);
+void prescan(double *weights, int N);
+/*
+  systematic resampling
+  Computes the number of copies of each particle and call
+  copyParticles() to overwrite the particle population
+ */
+void systematicRes(state_t *particles, double *weights, int N);
+/*
+  helper function called by various resampling algorithms
+  copies saves the number of copies for each particle. Particles with more
+  than one copies are copied to particles that have zero copy.
+ */
+void copyParticles(state_t *particles, int *copies, int N);
+/*
+  Compute the weighted average of the particle population and print
+  the estimate out.
+ */
+void printWeightedAve(state_t *particles, double *weights, int N, int time_step);
 
 int main(int argc, char ** argv)
 {
@@ -91,7 +104,8 @@ int main(int argc, char ** argv)
     size_t p_sz  = STATE_DIM * sizeof(state_t);
     size_t pp_sz = p_sz * N;
     size_t w_sz  = sizeof(double) * N;
-    size_t ob_sz = sizeof(obs_t) * OBS_DIM;
+    size_t ob_sz = sizeof(ob_t) * OB_DIM;
+    size_t in_sz = sizeof(input_t) * INPUT_DIM;
 
     struct timespec tp_start, tp_end;
     LOG2("starting with %d particles on CPU %d", N, sched_getcpu());
@@ -107,17 +121,19 @@ int main(int argc, char ** argv)
       so that when the child processes starts, the shared memory should already be
       opened.
     */
-    int fd_pp, fd_w, fd_gpu_n, fd_ob;
-    void *addr_pp, *addr_w, *addr_n, *addr_ob;
+    int fd_pp, fd_w, fd_gpu_n, fd_ob, fd_in;
+    void *addr_pp, *addr_w, *addr_n, *addr_ob, *addr_in;
     create_shm(fd_pp,    "/shm_pp",   pp_sz,        addr_pp);
     create_shm(fd_w,     "/shm_w",    w_sz,         addr_w);
     create_shm(fd_gpu_n, "/shm_gpu_n", sizeof(int), addr_n);
     create_shm(fd_ob,    "/shm_ob",   ob_sz,        addr_ob);
-    LOG("Opened and mmapped shared memory for particles, weights, gpu_n, and obs");
+    create_shm(fd_in,    "/shm_in",   in_sz,        addr_in);
+    LOG("Opened and mmapped shared memory for particles, weights, gpu_n, obs, and inputs");
 
     state_t* particles = (state_t*) addr_pp;
     double* weights = (double*)addr_w;
-    obs_t* ob = (obs_t*)addr_ob;
+    ob_t* ob = (ob_t*)addr_ob;
+    input_t* input = (input_t*)addr_in;
 
     /*
       System V semaphore
@@ -125,7 +141,10 @@ int main(int argc, char ** argv)
       1. Get a key (consider it as a filename for the semaphore set)
       2. Create a semaphore set (consider semid as a file descriptor)
       with 1 semaphore
-      3. Initialize the semaphore's value to 0
+      3. Initialize the semaphore's value to 1
+         We are waiting for the semaphore value to be 0 before entering the
+         iteration loop. The GPU process will decrement the semaphore to 0
+         when it is ready.
 
       Note that IPC_EXCL is not specified here for the same reason as O_EXCL is
       not specified in shm_open()
@@ -135,7 +154,7 @@ int main(int argc, char ** argv)
     int semid = semget(key, 1, IPC_CREAT | S_IRUSR | S_IWUSR);
     if (-1 == semid) errExit("semget");
     union semun arg;
-    arg.val = 0;
+    arg.val = 1;
     if (-1 == semctl(semid, 0, SETVAL, arg)) errExit("semctl");
     LOG2("Opened and initialized the semaphore set %d (value = %d)", semid, GETSEM);
     struct sembuf sops;
@@ -155,10 +174,6 @@ int main(int argc, char ** argv)
     mdl_init_particles(particles, N);
     TIME_END;
     LOG1("Initializing particles done in %lf seconds", ELAPSEDTIME);
-
-    //LOG("Particles:");
-    //printp(0, 10);
-    //printp((N-10), N);
 
     /*
       Creating a child process to run particle filter on the GPU
@@ -181,6 +196,10 @@ int main(int argc, char ** argv)
         break;
     }
     LOG1("main process running on CPU %d", sched_getcpu());
+    /*
+      We should wait the GPU process to get ready
+     */
+    semop0(0);
 
     //////////////////////////////////////////////////////////
     // Iteration t starts
@@ -189,6 +208,9 @@ int main(int argc, char ** argv)
     int t = 1, N_cpu;
     state_t p_new[STATE_DIM];
     double time_inc = 0.0;
+#ifdef WR2FILE
+    remove("state_estimate.txt");
+#endif
     do {
         LOG1(">>>>>>>>>> Iteration %d starts: <<<<<<<<<<", t);
         /*
@@ -202,6 +224,8 @@ int main(int argc, char ** argv)
         N_cpu = N - N_gpu;
         /* observation for the current time step */
         getObs(ob, t);
+        /* inputs from the last time step */
+        getInputs(input, t-1);
         if (N_gpu > 0){
             *((int*)addr_n) = N_gpu;
             /* Adaptation is done, now it is time to add 2 to the semaphore */
@@ -220,14 +244,13 @@ int main(int argc, char ** argv)
             ***********************************/
             for (int p = N_gpu; p < N; p ++){
                 /* Sampling */
-                mdl_propagate(&particles[p*STATE_DIM], p_new);
+                mdl_propagate(&particles[p*STATE_DIM], p_new, input);
                 /* Importance */
                 w = mdl_weight(p_new, ob);
                 /* Update memory */
                 memcpy(&particles[p*STATE_DIM], p_new, p_sz);
                 weights[p] = w;
             }
-            LOG1("CPU finished in %lf seconds", ELAPSEDTIME);
         } else
             LOG("Nothing to be done on CPU");
 
@@ -239,18 +262,28 @@ int main(int argc, char ** argv)
         if (N_gpu > 0)
             semop0(0);
         TIME_END;
+        LOG1("CPU finished in %lf seconds", ELAPSEDTIME);
         time_inc += ELAPSEDTIME;
         LOG1("GPU finished (sema value = %d)", GETSEM);
         /*******************************************
           Resampling
           Systematic global resampling
         ********************************************/
-        LOG2("Particle with max weight: (ob: %lf  %lf)", ob[obx], ob[oby]);
+        LOG1("State estimate for time step %d:", t);
+        ess = normalize(weights, N);
+        printOb(ob);
+#ifdef triv
         printMax(particles, weights, 0, N);
-
-        ess = prescan(weights, N);
+#elif defined(VAR)
+        printWeightedAve(particles, weights, N, t);
+#else
+#endif
+        prescan(weights, N);
         LOG2("ESS = %lf (N = %d)", ess, N);
-        if (ess < N/2) LOG("Resampling NEEDED!!!");
+        if (ess < N/2) {
+            LOG("Resampling NEEDED!!!");
+            systematicRes(particles, weights, N);
+        }
 
         LOG1(">>>>>>>>>> Iteration %d ends: <<<<<<<<<<", t);
         t++;
@@ -276,6 +309,7 @@ int main(int argc, char ** argv)
     shm_unlink("shm_gpu_n");
     shm_unlink("shm_w");
     shm_unlink("shm_ob");
+    shm_unlink("shm_in");
     LOG("Unlinked shared memory");
 
     /*
@@ -295,12 +329,6 @@ int particle_partition (int n, int argc, char ** argv)
             errExit("N_gpu is larger than N");
     }
     return N_gpu;
-}
-
-void getObs(obs_t *ob, int t)
-{
-    ob[obx] = (obs_t)(t*dt) + ((obs_t)random()/RAND_MAX-0.5)*.1;
-    ob[oby] = (obs_t)(t*dt) + ((obs_t)random()/RAND_MAX-0.5)*.1;
 }
 
 void printMax(state_t *particles, double * weight, int start, int end)
@@ -334,14 +362,101 @@ double normalize(double *weights, int N)
     return 1.0 / w2; // ESS
 }
 
-double prescan(double *weights, int N)
+void prescan(double *weights, int N)
 {
-    double ess = normalize(weights, N);
     double w_inc = 0.0, tmp, w2 = 0.0;
     for(int i = 0; i < N; i ++){
         tmp = weights[i];
         weights[i] += w_inc;
         w_inc += tmp;
     }
-    return ess;
+}
+
+void printWeightedAve(state_t *particles, double *weights, int N, int time_step)
+{
+#ifdef VERBOSE
+    state_t estimate[STATE_DIM] = {0};
+    for (int p = 0; p < N; p ++){
+        for (int st = 0; st < STATE_DIM; st ++){
+            estimate[st] += weights[p] * particles[p*STATE_DIM + st];
+        }
+    }
+    printf("\t%d:  ", time_step);
+    for (int st = 0; st < STATE_DIM; st ++)
+        printf("%lf  ", estimate[st]);
+    printf("\n");
+#ifdef WR2FILE
+    FILE *fd = fopen("state_estimate.txt", "a");
+    fprintf(fd, "%d:  ", time_step);
+    for (int st = 0; st < STATE_DIM; st ++)
+        fprintf(fd, "%lf  ", estimate[st]);
+    fprintf(fd, "\n");
+    fclose(fd);
+#endif
+#endif
+}
+
+/* copy particle from to particle to */
+void copyTo(state_t *particles, int from, int to)
+{
+    for (int st = 0; st < STATE_DIM; st ++)
+        particles[to * STATE_DIM + st] = particles[from * STATE_DIM + st];
+}
+
+void systematicRes(state_t *particles, double *weights, int N)
+{
+    /*
+      copies saves the number of copies for each particle.
+      All elements in copies are initialized to zero.
+     */
+    int *copies;
+    copies = (int*)calloc(N, sizeof(int));
+    double u = (double) random()/(double) RAND_MAX;
+    int w_idx = 0;
+    for (int newP = 0; newP < N; newP ++){
+        while (weights[w_idx] * N < u)
+            w_idx ++;
+        copies[w_idx] ++;
+        u += 1.0;
+    }
+    copyParticles(particles, copies, N);
+
+    free(copies);
+}
+
+void copyParticles(state_t *particles, int *copies, int N)
+{
+    /*
+      zeroIdx saves the indices of particles that will be discarded
+      plusIdx saves the indices of particles that will be copied for more than
+      one time
+    */
+    int *zeroIdx = (int*)calloc(N, sizeof(int));
+    int *plusIdx = (int*)calloc(N, sizeof(int));
+    int zeroCnt = 0, plusCnt = 0;
+    for (int i = 0; i < N; i++){
+        if (copies[i] == 0){
+            zeroIdx[zeroCnt] = i;
+            zeroCnt ++;
+        }
+        if (copies[i] > 1){
+            plusIdx[plusCnt] = i;
+            plusCnt ++;
+        }
+    }
+
+    int zIdx = 0, pIdx, copy;
+    for (int p = 0; p < plusCnt; p++){
+        pIdx = plusIdx[p];
+        copy = copies[pIdx];
+        while (copy > 1){
+            /* make a copy to replace a discarded particle */
+            copyTo(particles, pIdx, zeroIdx[zIdx]);
+            zIdx ++;
+            if (zIdx > zeroCnt) {printf("ERROR: zIdx > zeroCnt\n"); exit(0);}
+            copy --;
+        }
+    }
+    free(zeroIdx);
+    free(plusIdx);
 }

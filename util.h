@@ -58,11 +58,17 @@
         for (int st = 0; st < STATE_DIM; st ++)                 \
             printf("%9.6lf  ", particles[p * STATE_DIM + st]);  \
         printf("\t(%lf)\n", weights[p]);}
+#define printOb(ob)                   \
+    printf("\tObs: ");                \
+    for (int o = 0; o < OB_DIM; o ++) \
+        printf("%lf  ", ob[o]);       \
+    printf("\n");
 #else
 #define LOG(msg)
 #define LOG1(msg, val)
 #define LOG2(msg, val1, val2)
 #define printp(start, end)
+#define printOb(ob)
 #endif
 
 #endif

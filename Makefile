@@ -5,10 +5,14 @@ CUDA_SDK_PATH ?= /usr/local/cuda/samples/common/inc
 HOST_COMPILER ?= gcc
 NVCC          := $(CUDA_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
 
+MACRO = -D$(MODEL)
 ifeq ($(verbose),1)
-	MACRO=-DVERBOSE
+	MACRO += -DVERBOSE
 endif
-MACRO += -D$(MODEL)
+
+ifeq ($(write),1)
+	MACRO += -DWR2FILE
+endif
 
 all: main SI_gpu
 

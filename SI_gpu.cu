@@ -62,10 +62,11 @@ __global__ void setup_kernel(curandState *state)
   - The layout of particles in the global memory does not lead to coalesced access.
     We need transpose the memory either on the main process or the gpu process
  */
-__global__ void SI(curandState *state,
-                   state_t *particles,
-                   double *weights,
-                   obs_t *ob){
+#ifdef triv
+__global__ void SI_triv(curandState *state,
+                        state_t *particles,
+                        double *weights,
+                        ob_t *ob){
     int pid = threadIdx.x + blockDim.x * blockIdx.x;
     curandState localState = state[pid];
     /* propagation */
@@ -81,6 +82,100 @@ __global__ void SI(curandState *state,
     particles[pid*STATE_DIM+1] = p_new[1];
     state[pid] = localState;
 }
+#elif defined(VAR)
+__global__ void SI_VAR(curandState *state,
+                       state_t *particles,
+                       double *weights,
+                       ob_t *ob, input_t *input){
+    int pid = threadIdx.x + blockDim.x * blockIdx.x;
+    curandState localState = state[pid];
+
+    float2 rnn;
+    state_t *p_old = &particles[pid*STATE_DIM];
+    state_t p_new[STATE_DIM];
+    /* Reconstruct inputs */
+    double  Vram, P;
+    Vram = input[in_Vramc];
+    P = (Vc + Ri * p_old[8]) * p_old[8];
+    /* Sample process uncertainties */
+    rnn = curand_normal2(&localState);
+    double dI = dt * sigmaI * rnn.x;
+    double dVram = dt * sigmaVram * rnn.y;
+    rnn = curand_normal2(&localState);
+    double dmu = sqrt(dt) * sigmamur * rnn.x;
+    double dhe = sqrt(dt) * sigmahe * rnn.y;
+    /* Differential equations */
+    double deltadot, Gdot, Medot;
+    double Scldot, Smrdot;
+    deltadot = alphar*Cdd/p_old[0] - 4.0*Cdp*p_old[4]*P/pi/De/De/hm;
+    Gdot = a0 * (-alphar*Csd/p_old[0] + 4.0*Csp*p_old[4]*P/hm/pi/De/De)-Vram;
+    Medot = pi*rhor*De*De*alphar*Csd/4.0/p_old[0] - rhor*Csp*p_old[4]*P/hm;
+     if (Medot >= epsilon)
+     	Medot = epsilon;
+    Scldot = -Acl*(p_old[6]-Scl0)+Bdeltacl*(p_old[0]-delta0)+Bicl*(p_old[8]-I0)+
+        Bmucl*(p_old[4]-mu0)+Bhecl*(p_old[5]-phe0);
+    Smrdot = -Amr*(p_old[7]-Smr0)+Bdeltamr*(p_old[0]-delta0)+Bimr*(p_old[8]-I0)+
+        Bmumr*(p_old[4]-mu0)+Bhemr*(p_old[5]-phe0);
+    /* propagation */
+    // Delta: electrode thermal boundary layer
+    p_new[0] = p_old[0] + deltadot*dt + G11*dI;
+    if (p_new[0] < epsilon)
+     	p_new[0] = epsilon;
+    // G: electrode gap
+    p_new[1] = p_old[1] + Gdot*dt+ G21*dI - dVram;
+    if (p_new[1] < epsilon)
+     	p_new[1] = epsilon;
+    // Xram: ram position
+    p_new[2] = p_old[2] + dt*Vram + dVram;
+    // Me: electrode mass
+    p_new[3] = p_old[3] + Medot*dt + G41*dI;
+    if (p_new[3] < epsilon)
+     	p_new[3] = epsilon;
+    // mu: melting efficiency
+    p_new[4] = p_old[4] + dmu;
+    if (p_new[4] < epsilon)
+     	p_new[4] = epsilon;
+    // phe: helium pressure
+    p_new[5] = p_old[5] + dhe;
+    if (p_new[5] < epsilon)
+     	p_new[5] = epsilon;
+    // Scl: centerline pool depth and Smr: mid-radius pool depth
+    p_new[6] = p_old[6] + Scldot*dt + Bicl*dI;
+    if (p_new[6] < epsilon)
+     	p_new[6] = epsilon;
+    p_new[7] = p_old[7] + Smrdot*dt + Bimr*dI;
+    if (p_new[7] < epsilon)
+     	p_new[7] = epsilon;
+    double mI = input[in_Ic] + (input[in_Ic] - p_old[8])*exp(-dt/1.0);
+    p_new[8] = mI + dI;
+
+    /* Importance */
+    double w = 0.0;
+    double y_G    = p_new[1];
+    double y_Xram = p_new[2];
+    double y_I    = p_new[8];
+    double y_Me   = p_new[3];
+    double y_Scl  = p_new[6];
+    double y_Smr  = p_new[7];
+    double y_phe  = p_new[5];
+    double expo =
+        (ob[ob_G]    - y_G)    * (ob[ob_G]    - y_G)    / sigmaG/sigmaG +
+        (ob[ob_Xram] - y_Xram) * (ob[ob_Xram] - y_Xram) / sigmaPos/sigmaPos +
+        (ob[ob_I]    - y_I)    * (ob[ob_I]    - y_I)    / sigmaImeas/sigmaImeas +
+        (ob[ob_Me]   - y_Me)   * (ob[ob_Me]   - y_Me)   / sigmaLC/sigmaLC +
+        (ob[ob_Scl]  - y_Scl)  * (ob[ob_Scl]  - y_Scl)  / sigmaCL/sigmaCL +
+        (ob[ob_Smr]  - y_Smr)  * (ob[ob_Smr]  - y_Smr)  / sigmaMR/sigmaMR +
+        (ob[ob_phe]  - y_phe)  * (ob[ob_phe]  - y_phe)  / sigmahemeas/sigmahemeas;
+    w = exp(-0.5 * expo);
+
+    /* particle and weight update */
+    weights[pid] = w + 1e-99;
+    for (int st = 0; st < STATE_DIM; st ++)
+        particles[pid*STATE_DIM+st] = p_new[st];
+    state[pid] = localState;
+}
+#else
+#endif
 /*
   particle sub-population is saved in shared memory
   The number of particles is passed from my parent with a signal,
@@ -108,17 +203,19 @@ int main(int argc, char ** argv)
       We are getting the sub-particle population and the number of particles
       from the shared memory prepared by the main process.
      */
-    int fd_pp, fd_gpu_n, fd_w, fd_ob;
+    int fd_pp, fd_gpu_n, fd_w, fd_ob, fd_in;
     size_t p_sz = STATE_DIM * sizeof(state_t);
     size_t pp_sz = N * p_sz;
     size_t gpu_n_sz = sizeof (int);
     size_t w_sz  = sizeof(double) * N;
-    size_t ob_sz = sizeof(obs_t) * OBS_DIM;
-    void *addr_pp, *addr_n, *addr_w, *addr_ob;
+    size_t ob_sz = sizeof(ob_t) * OB_DIM;
+    size_t in_sz = sizeof(input_t) * INPUT_DIM;
+    void *addr_pp, *addr_n, *addr_w, *addr_ob, *addr_in;
     open_shm(fd_gpu_n, "/shm_gpu_n", gpu_n_sz, addr_n);
     open_shm(fd_pp,    "/shm_pp",    pp_sz,    addr_pp);
     open_shm(fd_w,     "/shm_w",     w_sz,     addr_w);
     open_shm(fd_ob,    "/shm_ob",    ob_sz,    addr_ob);
+    open_shm(fd_in,    "/shm_in",    in_sz,    addr_in);
 
     /* Check GPU status */
     int device;
@@ -127,7 +224,11 @@ int main(int argc, char ** argv)
     CUDA_CALL(cudaGetDeviceProperties(&properties,device));
     LOG1("Hello from %s", properties.name);
 
+#ifdef triv
     const unsigned int threads = 64;
+#else // VAR and EKD
+    const unsigned int threads = 128;
+#endif
     unsigned int blocks  = (N+threads-1) / threads;
 
     /* Initialize curand */
@@ -141,16 +242,25 @@ int main(int argc, char ** argv)
     state_t *devParticles;
     double *weights = (double*)addr_w;
     double *devWeights;
-    obs_t *obs = (obs_t*)addr_ob;
-    obs_t *devObs;
+    ob_t *obs = (ob_t*)addr_ob;
+    input_t *inputs = (input_t*)addr_in;
     CUDA_CALL(cudaMalloc((void**)&devParticles, pp_sz));
     CUDA_CALL(cudaMalloc((void**)&devWeights, w_sz));
+    ob_t *devObs;
     CUDA_CALL(cudaMalloc((void**)&devObs, ob_sz));
+    input_t *devInputs;
+    CUDA_CALL(cudaMalloc((void**)&devInputs, in_sz));
 
 
     ////////////////////////////////////////////////
     // start of current iteration
     ////////////////////////////////////////////////
+    /*
+      Before starting the iteration, decrement the semaphore.
+      This should set the semaphore to 0 and the main process should
+      know that we are ready.
+     */
+    semop0(-1);
     int iter = 1;
     do{
         LOG1(">>>>>>>>>> Iteration %d starts: <<<<<<<<<<", iter);
@@ -159,6 +269,10 @@ int main(int argc, char ** argv)
           and decrement the semaphore by 1
 
           And this marks the beginning of the current iteration on GPU
+
+          Note that, if N_gpu == 0, the semaphore value will never be increased.
+          Therefore, we are going to be blocked here until being killed by the
+          main process.
         */
         semop0(-1);
         LOG1("Particles are ready (sema value = %d)", GETSEM);
@@ -171,12 +285,12 @@ int main(int argc, char ** argv)
         /* Then copy N_gpu particles to device */
         CUDA_CALL(cudaMemcpy(devParticles, particles, p_sz*N_gpu, cudaMemcpyHostToDevice));
         CUDA_CALL(cudaMemcpy(devObs, obs, ob_sz, cudaMemcpyHostToDevice));
-        //printp(0, 15);
+        CUDA_CALL(cudaMemcpy(devInputs, inputs, in_sz, cudaMemcpyHostToDevice));
         /*
           Update the particles from the shared memory
         */
         LOG1("Updating particles 0 ~ %d on gpu: ", (N_gpu-1));
-        LOG2("Current observations: %lf, %lf", obs[0], obs[1]);
+        printOb(obs);
         /*
           Pay attention that we are working on shared memory pointers here.
           Make sure we do not overwrite the part of memory that does not belong
@@ -184,7 +298,16 @@ int main(int argc, char ** argv)
           and only the first N_gpu weights are updated.
          */
         blocks = (N_gpu+threads-1) / threads;
-        SI<<<blocks,threads>>>(devStates, devParticles, devWeights, devObs);
+#ifdef triv
+        SI_triv<<<blocks,threads>>>(devStates, devParticles, devWeights, devObs);
+#elif defined(VAR)
+        SI_VAR<<<blocks, threads>>>(devStates, devParticles, devWeights, devObs, devInputs);
+#elif defined(EKD)
+        LOG("EKD model not implemented yet!");
+#else
+        LOG("Unknown model!");
+        exit(0);
+#endif
         /* At last, copy result back to host */
         CUDA_CALL(cudaMemcpy(particles, devParticles, p_sz*N_gpu, cudaMemcpyDeviceToHost));
         CUDA_CALL(cudaMemcpy(weights, devWeights, sizeof(double)*N_gpu, cudaMemcpyDeviceToHost));
@@ -203,10 +326,12 @@ finish_update:
     /////////////////////////////////////////////////
     // end of current iteration
     /////////////////////////////////////////////////
+cleanup:
     LOG("I am all done. Bye yo");
 
     CUDA_CALL(cudaFree(devParticles));
     CUDA_CALL(cudaFree(devWeights));
     CUDA_CALL(cudaFree(devObs));
+    CUDA_CALL(cudaFree(devInputs));
     exit(0);
 }
