@@ -38,4 +38,4 @@ SI_gpu.o: SI_gpu.cu
 	$(NVCC) -I$(TLPI_PATH)/lib -L$(TLPI_PATH) $(MACRO) -o $@ -c $<  -ltlpi
 
 clean:
-	rm -f main *.o
+	rm -f main *.o SI_gpu

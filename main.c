@@ -99,7 +99,6 @@ int main(int argc, char ** argv)
         N = getInt(argv[1], 0, "total number of particles");
     if (argc > 3)
         t_max = getInt(argv[3], 0, "number of iterations");
-    int width = (int)log10(N) + 1;
 
     size_t p_sz  = STATE_DIM * sizeof(state_t);
     size_t pp_sz = p_sz * N;
@@ -108,6 +107,7 @@ int main(int argc, char ** argv)
     size_t in_sz = sizeof(input_t) * INPUT_DIM;
 
     struct timespec tp_start, tp_end;
+    struct timespec tp_cpu_start, tp_cpu_end;
     LOG2("starting with %d particles on CPU %d", N, sched_getcpu());
     LOG2("STATE_DIM = %d  state size: %ld bytes", STATE_DIM, p_sz);
 
@@ -184,12 +184,14 @@ int main(int argc, char ** argv)
      */
     pid_t gpuPid;
     char N_arg[100];
+    char t_arg[100];
     sprintf(N_arg, "%d", N);
+    sprintf(t_arg, "%d", t_max);
     switch(gpuPid = fork()){
     case -1:
         errExit("fork");
     case 0:
-        execl("./SI_gpu", "SI_gpu", N_arg, (char*)NULL);
+        execl("./SI_gpu", "SI_gpu", N_arg,t_arg,  (char*)NULL);
         errExit("execl");
         break;
     default:
@@ -208,6 +210,7 @@ int main(int argc, char ** argv)
     int t = 1, N_cpu;
     state_t p_new[STATE_DIM];
     double time_inc = 0.0;
+    double pure_cpu_time_inc = 0.0;
 #ifdef WR2FILE
     remove("state_estimate.txt");
 #endif
@@ -226,7 +229,7 @@ int main(int argc, char ** argv)
         getObs(ob, t);
         /* inputs from the last time step */
         getInputs(input, t-1);
-        if (N_gpu > 0){
+        //if (N_gpu > 0){
             *((int*)addr_n) = N_gpu;
             /* Adaptation is done, now it is time to add 2 to the semaphore */
             semop0(2);
@@ -236,7 +239,8 @@ int main(int argc, char ** argv)
               incremented, which means the gpu process will be blocked
               until being killed by the main process.
              */
-        }
+            //}
+        clock_gettime(CLOCK_REALTIME, &tp_cpu_start);
         if (N_cpu > 0){
             LOG2("CPU starts to work on particles %d ~ %d", N_gpu, N-1);
             /**********************************
@@ -253,17 +257,20 @@ int main(int argc, char ** argv)
             }
         } else
             LOG("Nothing to be done on CPU");
+        clock_gettime(CLOCK_REALTIME, &tp_cpu_end);
 
         /*
           Now let's wait for the gpuProcess to finish,
           i.e. when the semaphore becomes zero again
           This happens only when there is some work on the GPU.
         */
-        if (N_gpu > 0)
+        //if (N_gpu > 0)
             semop0(0);
         TIME_END;
         LOG1("CPU finished in %lf seconds", ELAPSEDTIME);
         time_inc += ELAPSEDTIME;
+        pure_cpu_time_inc += ((tp_cpu_end.tv_nsec - tp_cpu_start.tv_nsec)/1000000000.0 +
+                              (tp_cpu_end.tv_sec - tp_cpu_start.tv_sec));
         LOG1("GPU finished (sema value = %d)", GETSEM);
         /*******************************************
           Resampling
@@ -289,17 +296,19 @@ int main(int argc, char ** argv)
         t++;
     } while (t < t_max);
 
-    printf("%d  %d  %d  %lf\n", N, N_gpu, t_max-1, time_inc / (t_max-1));
+    // printf("%d  %d  %d  %lf\n", N, N_gpu, t_max-1, time_inc / (t_max-1));
+    // printf("%d  %d  %d  %lf\n", N, N_cpu, t_max-1, pure_cpu_time_inc / (t_max-1));
     /*
       We are waiting for the gpuProcess to terminate first
       kill the gpu process
      */
-    LOG1("Killing the gpu process [%d]", gpuPid);
-    if (-1 == kill(gpuPid, SIGTERM)) errExit("kill");
+    //LOG1("Killing the gpu process [%d]", gpuPid);
+    //if (-1 == kill(gpuPid, SIGTERM)) errExit("kill");
     int status;
     if (-1 == waitpid(gpuPid, &status, WUNTRACED | WCONTINUED))
         errExit("waitpid");
     LOG1("gpu[%d] has terminated", gpuPid);
+    printf("%lf  %lf\n", pure_cpu_time_inc / (t_max-1), time_inc / (t_max-1));
     /*
       This will unlink the shared memory from the current process
       and the shared memory will be removed from /dev/shm/ when all associated

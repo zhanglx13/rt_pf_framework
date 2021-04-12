@@ -3,6 +3,8 @@
  */
 //#define _GNU_SOURCE /* for sched_getcpu() */
 #include <unistd.h>
+#include <time.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sched.h> /* for sched_getcpu() */
@@ -184,8 +186,10 @@ __global__ void SI_VAR(curandState *state,
 int main(int argc, char ** argv)
 {
     LOG1("GPU process starting on CPU %d", sched_getcpu());
-    if (argc < 2) errExit("N not specified");
+    if (argc < 3) errExit("N and t_max not specified");
     int N = getInt(argv[1], 0, "total number of particles");
+    int iter_max = getInt(argv[2], 0, "total number of iterations");
+    int width = (int)log10(N) + 1;
 
     /*
       Open the semaphore set created by the main process
@@ -251,6 +255,9 @@ int main(int argc, char ** argv)
     input_t *devInputs;
     CUDA_CALL(cudaMalloc((void**)&devInputs, in_sz));
 
+    struct timespec tp_gpu_start, tp_gpu_end;
+    double time_inc = 0.0;
+
 
     ////////////////////////////////////////////////
     // start of current iteration
@@ -261,7 +268,7 @@ int main(int argc, char ** argv)
       know that we are ready.
      */
     semop0(-1);
-    int iter = 1;
+    int iter = 1, N_gpu;
     do{
         LOG1(">>>>>>>>>> Iteration %d starts: <<<<<<<<<<", iter);
         /*
@@ -277,7 +284,8 @@ int main(int argc, char ** argv)
         semop0(-1);
         LOG1("Particles are ready (sema value = %d)", GETSEM);
         /* First get N_gpu for gpu */
-        int N_gpu = *((int*) addr_n);
+        clock_gettime(CLOCK_REALTIME, &tp_gpu_start);
+        N_gpu = *((int*) addr_n);
         if (0 == N_gpu){
             LOG("No particles assigned");
             goto finish_update;
@@ -314,6 +322,9 @@ int main(int argc, char ** argv)
         cudaDeviceSynchronize();
         LOG("Finished updating particles");
 finish_update:
+        clock_gettime(CLOCK_REALTIME, &tp_gpu_end);
+        time_inc += ((tp_gpu_end.tv_nsec - tp_gpu_start.tv_nsec)/1000000000.0 +
+                     (tp_gpu_end.tv_sec - tp_gpu_start.tv_sec));
         /*
           Now it is the time to decrement the semaphore so that the main process can
           see value 0 in the semaphore
@@ -322,12 +333,13 @@ finish_update:
         LOG2("Decrement semaphore %d again (value = %d)", semid, GETSEM);
         LOG1(">>>>>>>>>> Iteration %d ends: <<<<<<<<<<", iter);
         iter ++;
-    }while(1);
+    }while(iter < iter_max);
     /////////////////////////////////////////////////
     // end of current iteration
     /////////////////////////////////////////////////
 cleanup:
     LOG("I am all done. Bye yo");
+    printf("%d  %*d  %*d  %d  %lf  ", N, width, N_gpu, width, N-N_gpu, iter_max-1, time_inc / (iter_max-1));
 
     CUDA_CALL(cudaFree(devParticles));
     CUDA_CALL(cudaFree(devWeights));
