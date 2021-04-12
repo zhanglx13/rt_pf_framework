@@ -36,3 +36,9 @@ double mdl_weight(state_t *p, obs_t *ob)
     double dis = sqrt((p[0]-ob[0])*(p[0]-ob[0]) + (p[1]-ob[1])*(p[1]-ob[1]));
     return 1.0 / (dis+1.0);
 }
+
+void getObs(obs_t *ob, int t)
+{
+    ob[obx] = (obs_t)(t*dt) + ((obs_t)random()/RAND_MAX-0.5)*.1;
+    ob[oby] = (obs_t)(t*dt) + ((obs_t)random()/RAND_MAX-0.5)*.1;
+}
