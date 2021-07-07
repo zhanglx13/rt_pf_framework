@@ -6,7 +6,6 @@
     make MODEL=triv verbose=1
   - Else, do
     make MODEL=triv
-  So far only the triv model is implemented
 2. To run
   ./main N N_gpu t_max
   where N is the total number of particles, default: 5000

@@ -1,7 +1,12 @@
 SI_gpu
 main
 *.o
-figure.pdf
+figure*.pdf
+optimal_*.pdf
+test*
 *.txt
-draw.gp
-run.sh
+draw*
+*result*
+run*
+log.md
+VAR_data
